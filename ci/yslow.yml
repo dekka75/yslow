@@ -1,25 +1,40 @@
 config:
+
+- &git-config
+  uri: git@github.com:dekka75/yslow.git
+  branch: master
+  private_key: {{ci-ssh-key}}
+
 - &docker-config
   insecure_registries: ["10.0.2.2:6000"]
 
-
 resources:
-- name: every-1m
-  type: time
-  source: {interval: 5m}
+
+- name: yslow-image-repo
+  type: git
+  source:
+    <<: *git-config
+    paths: [ci/dockerfiles/yslow-dockerfile]
 
 - name: yslow-image
   type: docker-image
   source:
-     <<: *docker-config
-     repository: "10.0.2.2:6000/yslow-image"
-
+    <<: *docker-config
+    repository: "10.0.2.2:6000/yslow-image"
 
 jobs:
+
+- name: build-yslow-image
+  plan:
+  - get: yslow-image-repo
+    trigger: true
+  - put: yslow-image
+    params:
+      build: yslow-image-repo
+      dockerfile: yslow-image-repo/ci/dockerfiles/yslow-dockerfile
+
 - name: yslow
   plan:
-  - get: every-1m
-    trigger: true
   - task: score
     config:
       platform: linux
@@ -27,5 +42,4 @@ jobs:
         type: docker-image
         source: {repository: yslow-image}
       run:
-        path: yslow.sh
 
