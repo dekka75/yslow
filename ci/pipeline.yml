@@ -1,0 +1,985 @@
+# -----------------------------------------------------------------------------
+# This is our custom configuration, not part of the concourse schema
+#
+# We label common configuration options with &label to avoid repeating them
+# -----------------------------------------------------------------------------
+
+config:
+- &git-config
+  uri: ssh://gitolite@www.forge.orange-labs.fr/atome/Sysclope.git
+  branch: master
+  private_key: {{ci-ssh-key}}
+
+- &docker-config
+  insecure_registries: ["10.0.2.2:6000"]
+
+- &pcf-config
+  api: https://api.cf.si.fr.intraorange
+  organization: BoutiquePro-dev
+  skip_cert_check: true
+  username: {{pcf-username}}
+  password: {{pcf-password}}
+
+- &rsync-config
+  server: 10.0.2.2
+  user: {{ci-ssh-user}}
+  private_key: {{ci-ssh-key}}
+
+
+# -----------------------------------------------------------------------------
+# Resource types tells Concourse about 3rd party resources
+#
+# Concourse will pull a docker image and use it as the resource implementation
+# -----------------------------------------------------------------------------
+
+resource_types:
+- name: rsync-resource
+  type: docker-image
+  source:
+      repository: mrsixw/concourse-rsync-resource
+      tag: latest
+
+
+# -----------------------------------------------------------------------------
+# The pipeline consists of resources and jobs
+#
+# Resources are immutable versioned sources that we can pull from and push to.
+# -----------------------------------------------------------------------------
+
+resources:
+
+# -----------------------------------------------------------------------------
+# git resources
+#
+# These all refer to the same repo but target specific paths.
+# New versions will only be available if those paths have changes.
+# -----------------------------------------------------------------------------
+
+- name: web-image-repo
+  type: git
+  source:
+    <<: *git-config
+    paths: [web/package.json, ci/dockerfiles/web-dockerfile]
+
+- name: e2e-image-repo
+  type: git
+  source:
+    <<: *git-config
+    paths: [web/package.json, ci/dockerfiles/e2e-dockerfile]
+
+- name: service-image-repo
+  type: git
+  source:
+    <<: *git-config
+    paths: ['*/pom.xml', ci/dockerfiles/service-dockerfile, ci/dockerfiles/settings-docker.xml]
+
+- name: idzone-repo
+  type: git
+  source:
+    <<: *git-config
+    paths: [idzone-service, ci/tasks/mvn-test.yml]
+
+- name: eligibility-repo
+  type: git
+  source:
+    <<: *git-config
+    paths: [eligibility-service, ci/tasks/mvn-package.yml, ci/pcf-*/eligibility-manifest*.yml]
+
+- name: index-server-repo
+  type: git
+  source:
+    <<: *git-config
+    paths: [index-server, ci/tasks/mvn-package.yml, ci/pcf-*/index-server*.yml]
+
+- name: esoft-repo
+  type: git
+  source:
+    <<: *git-config
+    paths: [esoft-service, ci/tasks/mvn-package.yml, ci/pcf-*/esoft-manifest*.yml]
+
+- name: product-repo
+  type: git
+  source:
+    <<: *git-config
+    paths: [product-service, ci/tasks/mvn-package.yml, ci/pcf-*/product-manifest*.yml]
+
+- name: wassup-repo
+  type: git
+  source:
+    <<: *git-config
+    paths: [wassup-service, ci/tasks/mvn-package.yml, ci/pcf-*/wassup-manifest*.yml]
+
+- name: client-repo
+  type: git
+  source:
+    <<: *git-config
+    paths: [client-service, ci/tasks/mvn-package.yml, ci/pcf-*/client-manifest*.yml]
+
+
+- name: mocks-repo
+  type: git
+  source:
+    <<: *git-config
+    paths: [mocks-service, ci/tasks/mvn-package.yml, ci/pcf-*/mocks-manifest*.yml]
+
+- name: web-repo
+  type: git
+  source:
+    <<: *git-config
+    paths: [web, ci/tasks/ng-build.yml, ci/tasks/ng-test.yml, ci/pcf-*/web-manifest*.yml, ci/pcf-orange/coverage-manifest.yml]
+    ignore_paths: *e2e-files
+
+- name: e2e-repo
+  type: git
+  source:
+    <<: *git-config
+    paths: &e2e-files [web/e2e, ci/tasks/ng-e2e.yml, web/protractor.conf.js, web/protractor.conf.ci.js, web/protractor.conf.prod.js]
+
+- name: publish-repo
+  type: git
+  source:
+    <<: *git-config
+    paths: [ci/tasks/version-and-scp-packages.yml, ci/tasks/git-tagging-version.yml, ci/tasks/create-stories-json.yml, ci/deploy/version-production.txt]
+
+- name: health-check-repo
+  type: git
+  source:
+    <<: *git-config
+    paths: [ci/scripts/healthcheck.go, ci/tasks/healthcheck.yml]
+
+- name: global-repo
+  type: git
+  source:
+    <<: *git-config
+
+- name: version-recette-repo
+  type: git
+  source:
+    <<: *git-config
+    paths: [ci/deploy/version-recette.txt, ci/tasks/retrieve-version.yml, ci/tasks/send-minion-event.yml]
+
+- name: version-production-repo
+  type: git
+  source:
+    <<: *git-config
+    paths: [ci/deploy/version-production.txt, ci/tasks/retrieve-version.yml, ci/tasks/send-minion-event.yml]
+
+- name: deploy-image-repo
+  type: git
+  source:
+    <<: *git-config
+    paths: [ci/dockerfiles/deploy-dockerfile]
+
+# -----------------------------------------------------------------------------
+# docker image resources
+#
+# We build these images to speed up the main web and service builds.
+# They fetch the dependencies in advance and include extra tools we need.
+# -----------------------------------------------------------------------------
+
+- name: web-image
+  type: docker-image
+  source:
+    <<: *docker-config
+    repository: "10.0.2.2:6000/web-image"
+
+- name: e2e-image
+  type: docker-image
+  source:
+    <<: *docker-config
+    repository: "10.0.2.2:6000/e2e-image"
+
+- name: service-image
+  type: docker-image
+  source:
+    <<: *docker-config
+    repository: "10.0.2.2:6000/service-image"
+
+- name: deploy-image
+  type: docker-image
+  source:
+    <<: *docker-config
+    repository: "10.0.2.2:6000/deploy-image"
+
+# -----------------------------------------------------------------------------
+# cf resources
+#
+# These are test environments that we push to. Most of the configuration for
+# the deployments is contained in the manifest.yml files.
+# -----------------------------------------------------------------------------
+
+- name: pcf-ci
+  type: cf
+  source:
+    <<: *pcf-config
+    space: Khepera-ci
+
+- name: pcf-acceptance
+  type: cf
+  source:
+    <<: *pcf-config
+    space: Khepera
+
+- name: pcf-recette
+  type: cf
+  source:
+    <<: *pcf-config
+    space: Khepera-recette
+
+- name: pcf-production
+  type: cf
+  source:
+    <<: *pcf-config
+    space: Khepera-production
+# -----------------------------------------------------------------------------
+# semver resources
+#
+# These help us track the versions of our builds. They are tracked in a special
+# branch in git that only contains a version.txt file.
+# -----------------------------------------------------------------------------
+
+- name: version
+  type: semver
+  source:
+    driver: git
+    <<: *git-config
+    branch: version
+    file: version.txt
+
+# -----------------------------------------------------------------------------
+# rsync resources
+#
+# We use these for storing intermediate build artifacts
+# to pass between jobs
+# -----------------------------------------------------------------------------
+
+- name: web-intermediate
+  type: rsync-resource
+  source:
+    <<: *rsync-config
+    base_dir: /home/shared/concourse/artifacts-rsync/web-intermediate
+
+- name: eligibility-intermediate
+  type: rsync-resource
+  source:
+    <<: *rsync-config
+    base_dir: /home/shared/concourse/artifacts-rsync/eligibility-intermediate
+
+- name: index-server-intermediate
+  type: rsync-resource
+  source:
+    <<: *rsync-config
+    base_dir: /home/shared/concourse/artifacts-rsync/index-server-intermediate
+
+- name: esoft-intermediate
+  type: rsync-resource
+  source:
+    <<: *rsync-config
+    base_dir: /home/shared/concourse/artifacts-rsync/esoft-intermediate
+
+- name: product-intermediate
+  type: rsync-resource
+  source:
+    <<: *rsync-config
+    base_dir: /home/shared/concourse/artifacts-rsync/product-intermediate
+
+- name: wassup-intermediate
+  type: rsync-resource
+  source:
+    <<: *rsync-config
+    base_dir: /home/shared/concourse/artifacts-rsync/wassup-intermediate
+
+- name: client-intermediate
+  type: rsync-resource
+  source:
+    <<: *rsync-config
+    base_dir: /home/shared/concourse/artifacts-rsync/client-intermediate
+
+# -----------------------------------------------------------------------------
+# time resources
+#
+# like cron but more web 2.0
+# -----------------------------------------------------------------------------
+- name: health-check-timer
+  type: time
+  source: {interval: 20m}
+- name: health-check-timer-1h
+  type: time
+  source: {interval: 1h}
+
+
+# -----------------------------------------------------------------------------
+# The pipeline consists of resources and jobs
+#
+# Jobs are sequences of tasks that act on the resources.
+# -----------------------------------------------------------------------------
+
+jobs:
+
+# -----------------------------------------------------------------------------
+# health check jobs
+#
+# These give us visibility on the CI monitor of the health of our services
+# as well as certain third parties
+# -----------------------------------------------------------------------------
+
+- name: eligibility-health
+  plan:
+  - get: health-check-timer
+    trigger: true
+  - get: repo
+    trigger: true
+    resource: health-check-repo
+  - task: run-health-check
+    file: repo/ci/tasks/healthcheck.yml
+    params:
+      HEALTH_URL: https://khepera.cfapps.orange.fr/api/eligibility/actuator/health
+      SERVICE_USERNAME: user
+      SERVICE_PASSWORD: {{eligibility-password}}
+
+- name: esoft-health
+  plan:
+  - get: health-check-timer
+    trigger: true
+  - get: repo
+    trigger: true
+    resource: health-check-repo
+  - task: run-health-check
+    file: repo/ci/tasks/healthcheck.yml
+    params:
+      HEALTH_URL: https://khepera-internal.cfapps.si.fr.intraorange/api/esoft/actuator/health
+      SERVICE_USERNAME: {{esoft-username}}
+      SERVICE_PASSWORD: {{esoft-password}}
+
+# -----------------------------------------------------------------------------
+# build image jobs
+#
+# These configure base images for builds and push to our internal docker repo.
+# -----------------------------------------------------------------------------
+
+- name: build-web-image
+  plan:
+  - get: web-image-repo
+    trigger: true
+  - put: web-image
+    params:
+      build: web-image-repo
+      dockerfile: web-image-repo/ci/dockerfiles/web-dockerfile
+
+- name: build-e2e-image
+  plan:
+  - get: e2e-image-repo
+    trigger: true
+  - put: e2e-image
+    params:
+      build: e2e-image-repo
+      dockerfile: e2e-image-repo/ci/dockerfiles/e2e-dockerfile
+      build_args:
+        https_proxy: http://10.0.2.2:3128
+        http_proxy: http://10.0.2.2:3128
+
+- name: build-service-image
+  plan:
+  - get: service-image-repo
+    trigger: true
+  - put: service-image
+    params:
+      build: service-image-repo
+      dockerfile: service-image-repo/ci/dockerfiles/service-dockerfile
+
+- name: build-deploy-image
+  plan:
+  - get: deploy-image-repo
+    trigger: true
+  - put: deploy-image
+    params:
+      build: deploy-image-repo
+      dockerfile: deploy-image-repo/ci/dockerfiles/deploy-dockerfile
+
+# -----------------------------------------------------------------------------
+# main build jobs
+#
+# These compile, unit-test and package the main application code and push the
+# the updated applications to the pcf-ci test environment
+# -----------------------------------------------------------------------------
+
+- name: idzone
+  serial_groups: [khepera]
+  plan:
+  - get: repo
+    resource: idzone-repo
+    trigger: true
+  - get: service-image
+    passed: [build-service-image]
+  - task: run-mvn-test
+    file: repo/ci/tasks/mvn-test.yml
+    params: { PROJECT_NAME: idzone }
+
+- name: eligibility
+  serial_groups: [khepera]
+  plan:
+  - get: repo
+    resource: eligibility-repo
+    trigger: true
+  - get: service-image
+    passed: [build-service-image]
+  - task: run-mvn-package
+    file: repo/ci/tasks/mvn-package.yml
+    params: { PROJECT_NAME: eligibility }
+    # don't parallelize these steps, we want to make sure the deploy to
+    # test environment has completed before we trigger the e2e tests
+  - put: pcf-ci
+    params:
+      manifest: repo/ci/pcf-ci/eligibility-manifest.yml
+      path: service/eligibility.jar
+  - put: eligibility-intermediate
+    params:
+      sync_dir: service
+
+- name: index-server
+  serial_groups: [khepera]
+  plan:
+  - get: repo
+    resource: index-server-repo
+    trigger: true
+  - get: service-image
+    passed: [build-service-image, idzone]
+  - task: run-mvn-package
+    file: repo/ci/tasks/mvn-package.yml
+    params: { PROJECT_DIRECTORY: index-server, PROJECT_NAME: index-server }
+    # don't parallelize these steps, we want to make sure the deploy to
+    # test environment has completed before we trigger the e2e tests
+  - put: pcf-ci
+    params:
+      manifest: repo/ci/pcf-ci/index-server-manifest.yml
+      path: service/index-server.jar
+  - put: index-server-intermediate
+    params:
+      sync_dir: service
+
+- name: esoft
+  serial_groups: [khepera]
+  plan:
+  - get: repo
+    resource: esoft-repo
+    trigger: true
+  - get: service-image
+    passed: [build-service-image]
+  - task: run-mvn-package
+    file: repo/ci/tasks/mvn-package.yml
+    params: { PROJECT_NAME: esoft }
+  - put: pcf-ci
+    params:
+      manifest: repo/ci/pcf-ci/esoft-manifest.yml
+      path: service/esoft.jar
+  - put: esoft-intermediate
+    params:
+      sync_dir: service
+
+- name: product
+  serial_groups: [khepera]
+  plan:
+  - get: repo
+    resource: product-repo
+    trigger: true
+  - get: service-image
+    passed: [build-service-image]
+  - task: run-mvn-package
+    file: repo/ci/tasks/mvn-package.yml
+    params: { PROJECT_NAME: product }
+  - put: pcf-ci
+    params:
+      manifest: repo/ci/pcf-ci/product-manifest.yml
+      path: service/product.jar
+  - put: product-intermediate
+    params:
+      sync_dir: service
+
+- name: wassup
+  serial_groups: [khepera]
+  plan:
+  - get: repo
+    resource: wassup-repo
+    trigger: true
+  - get: service-image
+    passed: [build-service-image]
+  - task: run-mvn-package
+    file: repo/ci/tasks/mvn-package.yml
+    params: { PROJECT_NAME: wassup }
+  - put: pcf-ci
+    params:
+      manifest: repo/ci/pcf-ci/wassup-manifest.yml
+      path: service/wassup.jar
+  - put: wassup-intermediate
+    params:
+      sync_dir: service
+
+- name: client
+  serial_groups: [khepera]
+  plan:
+  - get: repo
+    resource: client-repo
+    trigger: true
+  - get: service-image
+    passed: [build-service-image]
+  - task: run-mvn-package
+    file: repo/ci/tasks/mvn-package.yml
+    params: { PROJECT_NAME: client }
+  - put: pcf-ci
+    params:
+      manifest: repo/ci/pcf-ci/client-manifest.yml
+      path: service/client.jar
+  - put: client-intermediate
+    params:
+      sync_dir: service
+
+- name: mocks
+  serial_groups: [khepera]
+  plan:
+  - get: repo
+    resource: mocks-repo
+    trigger: true
+  - get: service-image
+    passed: [build-service-image]
+  - task: run-mvn-package
+    file: repo/ci/tasks/mvn-package.yml
+    params: { PROJECT_NAME: mocks }
+  - put: pcf-ci
+    params:
+      manifest: repo/ci/pcf-ci/mocks-manifest.yml
+      path: service/mocks.jar
+
+- name: web
+  serial_groups: [khepera]
+  plan:
+  - get: repo
+    resource: web-repo
+    trigger: true
+  - get: web-image
+    passed: [build-web-image]
+    # This task will build for both recette and production environments
+  - task: run-ng-build
+    file: repo/ci/tasks/ng-build.yml
+    params: { PROJECT_NAME: web }
+
+    # don't parallelize these steps, we want to make sure the deploy to
+    # test environment has completed before we trigger the e2e tests
+  - put: pcf-ci
+    params:
+      manifest: repo/ci/pcf-ci/web-manifest.yml
+      path: web-build-for-e2e
+  - put: web-intermediate
+    params:
+      sync_dir: web
+
+# -----------------------------------------------------------------------------
+# integration test jobs
+#
+# e2e runs tests against the applications that have been deployed to the pcf-ci
+#  test environment. this tests that the different services are compatible
+# -----------------------------------------------------------------------------
+
+- name: e2e
+  serial_groups: [khepera]
+  plan:
+  - aggregate:
+    - get: e2e-image
+      passed: [build-e2e-image]
+    - get: repo
+      resource: e2e-repo
+      trigger: true
+    - get: eligibility-intermediate
+      trigger: true
+      passed: [eligibility]
+    - get: index-server-intermediate
+      trigger: true
+      passed: [index-server]
+    - get: esoft-intermediate
+      trigger: true
+      passed: [esoft]
+    - get: product-intermediate
+      trigger: true
+      passed: [product]
+    - get: wassup-intermediate
+      trigger: true
+      passed: [wassup]
+    - get: client-intermediate
+      trigger: true
+      passed: [client]
+    - get: web-intermediate
+      trigger: true
+      passed: [web]
+  - task: run-ng-e2e-with-proxy
+    file: repo/ci/tasks/ng-e2e.yml
+    params: { E2E_ENV: ci-proxy }
+  - task: run-ng-e2e-without-proxy
+    file: repo/ci/tasks/ng-e2e.yml
+    params: { E2E_ENV: ci }
+
+- name: e2e-prod
+  serial_groups: [khepera]
+  plan:
+  - aggregate:
+    - get: health-check-timer-1h
+      trigger: true
+    - get: repo
+      resource: e2e-repo
+    - get: e2e-image
+      passed: [build-e2e-image]
+    - get: web-intermediate
+      passed: [web]
+  - task: run-ng-e2e
+    file: repo/ci/tasks/ng-e2e.yml
+    params: { E2E_ENV: prod }
+
+# -----------------------------------------------------------------------------
+# publish jobs
+#
+# this versions and makes the packages available externally
+# -----------------------------------------------------------------------------
+
+- name: publish
+  serial_groups: [version, khepera]
+  plan:
+  - get: previous-version
+    resource: version
+  - aggregate:
+    - get: version
+      params: { bump: patch }
+    - get: repo
+      resource: publish-repo
+      trigger: true
+    - get: global-repo
+    - get: eligibility-intermediate
+      trigger: true
+      passed: [e2e]
+    - get: index-server-intermediate
+      trigger: true
+      passed: [e2e]
+    - get: esoft-intermediate
+      trigger: true
+      passed: [e2e]
+    - get: product-intermediate
+      trigger: true
+      passed: [e2e]
+    - get: wassup-intermediate
+      trigger: true
+      passed: [e2e]
+    - get: client-intermediate
+      trigger: true
+      passed: [e2e]
+    - get: web-intermediate
+      trigger: true
+      passed: [e2e]
+  - task: version-and-scp-packages
+    file: repo/ci/tasks/version-and-scp-packages.yml
+    params:
+      PRIVATE_KEY: {{ci-ssh-key}}
+      SSH_USER: {{ci-ssh-user}}
+  - task: git-tagging-version
+    file: repo/ci/tasks/git-tagging-version.yml
+    params:
+      PRIVATE_KEY: {{ci-ssh-key}}
+#      Commenté temporairement : impossible de build l'image pb sur librairie curl
+#  - get: deploy-image
+#    passed: [build-deploy-image]
+#  - task: create-stories-json
+#    file: repo/ci/tasks/create-stories-json.yml
+#    params:
+#      PRIVATE_KEY: {{ci-ssh-key}}
+#      SSH_USER: {{ci-ssh-user}}
+  - put: version
+    params: { bump: patch }
+
+- name: deploy-acceptance
+  serial_groups: [version, khepera]
+  plan:
+  - get: version
+    resource: version
+    trigger: true
+    passed: [publish]
+  - get: repo
+    resource: global-repo
+  - task: send-minion-info
+    file: repo/ci/tasks/send-minion-event.yml
+    params:
+      ENVIRONMENT: ACCEPTANCE
+      VERSION_FILE: version/number
+      MESSAGE_TYPE: deploying
+  - task: retrieve-version
+    file: repo/ci/tasks/retrieve-version.yml
+    params:
+      PRIVATE_KEY: {{ci-ssh-key}}
+      SSH_USER: {{ci-ssh-user}}
+      TARGET_ENV: acceptance
+# TODO: For now we can't use aggregate because it breaks the task
+# with the message "error: Error restarting application: InsufficientResources"
+# One guess is that the blue-green deploy will create double the
+# applications and it reaches the limit of the pcf-orange
+#  - aggregate:
+  - do:
+    - put: esoft-service
+      resource: pcf-acceptance
+      params:
+        manifest: packages/esoft/esoft-manifest.yml
+        current_app_name: esoft-service
+    - put: product-service
+      resource: pcf-acceptance
+      params:
+        manifest: packages/product/product-manifest.yml
+        current_app_name: product-service
+    - put: wassup-service
+      resource: pcf-acceptance
+      params:
+        manifest: packages/wassup/wassup-manifest.yml
+        current_app_name: wassup-service
+    - put: client-service
+      resource: pcf-acceptance
+      params:
+        manifest: packages/client/client-manifest.yml
+        current_app_name: client-service
+    - put: eligibility-service
+      resource: pcf-acceptance
+      params:
+        manifest: packages/eligibility/eligibility-manifest.yml
+        current_app_name: eligibility-service
+    - put: index-server
+      resource: pcf-acceptance
+      params:
+        manifest: packages/index-server/index-server-manifest.yml
+        current_app_name: index-server
+    - put: web
+      resource: pcf-acceptance
+      params:
+        manifest: packages/web/web-manifest.yml
+        current_app_name: web
+    - put: code-coverage
+      resource: pcf-acceptance
+      params:
+        manifest: repo/ci/pcf-orange/coverage-manifest.yml
+        path: packages/code-coverage
+    on_failure:
+      task: send-minion-info
+      file: repo/ci/tasks/send-minion-event.yml
+      params:
+        ENVIRONMENT: ACCEPTANCE
+        VERSION_FILE: version/number
+        MESSAGE_TYPE: failure
+  - task: send-minion-info
+    file: repo/ci/tasks/send-minion-event.yml
+    params:
+      ENVIRONMENT: ACCEPTANCE
+      VERSION_FILE: version/number
+      MESSAGE_TYPE: deployed
+
+
+- name: deploy-recette
+  serial_groups: [version, khepera]
+  plan:
+  - get: repo
+    resource: version-recette-repo
+    trigger: true
+  - get: version # we don't use it but we have to provide it as the task expects it
+    resource: version
+  - task: send-minion-info
+    file: repo/ci/tasks/send-minion-event.yml
+    params:
+      ENVIRONMENT: RECETTE
+      VERSION_FILE: repo/ci/deploy/version-recette.txt
+      MESSAGE_TYPE: deploying
+  - task: retrieve-version
+    file: repo/ci/tasks/retrieve-version.yml
+    params:
+      PRIVATE_KEY: {{ci-ssh-key}}
+      SSH_USER: {{ci-ssh-user}}
+      TARGET_ENV: recette
+
+  - aggregate:
+    - put: esoft-service
+      resource: pcf-recette
+      params:
+        manifest: packages/esoft/esoft-manifest-rec.yml
+        current_app_name: esoft-service
+    - put: product-service
+      resource: pcf-recette
+      params:
+        manifest: packages/product/product-manifest-rec.yml
+        current_app_name: product-service
+#    wassup-service did'nt exist in current recette version
+#    so we disabled it until we use version >= 1.2.64
+#
+#    - put: wassup-service
+#      resource: pcf-recette
+#      params:
+#        manifest: packages/wassup/wassup-manifest-rec.yml
+#        current_app_name: wassup-service
+
+#    client-service did'nt exist in current recette version
+#    so we disabled it until we use version >= 1.2.93
+#
+#    - put: client-service
+#      resource: pcf-recette
+#      params:
+#        manifest: packages/client/client-manifest-rec.yml
+#        current_app_name: client-service
+    - put: eligibility-service
+      resource: pcf-recette
+      params:
+        manifest: packages/eligibility/eligibility-manifest-rec.yml
+        current_app_name: eligibility-service
+    - put: index-server
+      resource: pcf-recette
+      params:
+        manifest: packages/index-server/index-server-manifest-rec.yml
+        current_app_name: index-server
+    - put: web
+      resource: pcf-recette
+      params:
+        manifest: packages/web/web-manifest-rec.yml
+        current_app_name: web
+    on_failure:
+      task: send-minion-info
+      file: repo/ci/tasks/send-minion-event.yml
+      params:
+        ENVIRONMENT: RECETTE
+        VERSION_FILE: repo/ci/deploy/version-recette.txt
+        MESSAGE_TYPE: failure
+  - task: send-minion-info
+    file: repo/ci/tasks/send-minion-event.yml
+    params:
+      ENVIRONMENT: RECETTE
+      VERSION_FILE: repo/ci/deploy/version-recette.txt
+      MESSAGE_TYPE: deployed
+
+
+- name: deploy-production
+  serial_groups: [version, khepera]
+  plan:
+  - get: repo
+    resource: version-production-repo
+    trigger: true
+  - get: version # we don't use it but we have to provide it as the task expects it
+    resource: version
+  - task: send-minion-info
+    file: repo/ci/tasks/send-minion-event.yml
+    params:
+      ENVIRONMENT: PRODUCTION
+      VERSION_FILE: repo/ci/deploy/version-production.txt
+      MESSAGE_TYPE: deploying
+  - task: retrieve-version
+    file: repo/ci/tasks/retrieve-version.yml
+    params:
+      PRIVATE_KEY: {{ci-ssh-key}}
+      SSH_USER: {{ci-ssh-user}}
+      TARGET_ENV: production
+  - aggregate:
+    - put: esoft-service
+      resource: pcf-production
+      params:
+        manifest: packages/esoft/esoft-manifest-prod.yml
+        current_app_name: esoft-service
+    - put: product-service
+      resource: pcf-production
+      params:
+        manifest: packages/product/product-manifest-prod.yml
+        current_app_name: product-service
+#    wassup-service did'nt exist in current production version
+#    so we disabled it  until we use version >= 1.2.64
+#    - put: wassup-service
+#      resource: pcf-production
+#      params:
+#        manifest: packages/wassup/wassup-manifest-prod.yml
+#        current_app_name: wassup-service
+
+#    client-service did'nt exist in current production version
+#    so we disabled it  until we use version >= 1.2.93
+#    - put: client-service
+#      resource: pcf-production
+#      params:
+#        manifest: packages/client/client-manifest-prod.yml
+#        current_app_name: client-service
+    - put: eligibility-service
+      resource: pcf-production
+      params:
+        manifest: packages/eligibility/eligibility-manifest-prod.yml
+        current_app_name: eligibility-service
+    - put: index-server
+      resource: pcf-production
+      params:
+        manifest: packages/index-server/index-server-manifest-prod.yml
+        current_app_name: index-server
+    - put: web
+      resource: pcf-production
+      params:
+        manifest: packages/web/web-manifest-prod.yml
+        current_app_name: web
+    on_failure:
+      task: send-minion-info
+      file: repo/ci/tasks/send-minion-event.yml
+      params:
+        ENVIRONMENT: PRODUCTION
+        VERSION_FILE: repo/ci/deploy/version-production.txt
+        MESSAGE_TYPE: failure
+  - task: send-minion-info
+    file: repo/ci/tasks/send-minion-event.yml
+    params:
+      ENVIRONMENT: PRODUCTION
+      VERSION_FILE: repo/ci/deploy/version-production.txt
+      MESSAGE_TYPE: deployed
+
+# -----------------------------------------------------------------------------
+# version jobs
+#
+# these jobs can be run manually to increment the major or minor version number
+# -----------------------------------------------------------------------------
+
+- name: major
+  serial_groups: [version]
+  plan:
+  - put: version
+    params: { bump: major }
+
+- name: minor
+  serial_groups: [version]
+  plan:
+  - put: version
+    params: { bump: minor }
+
+
+# -----------------------------------------------------------------------------
+# Groups
+#
+# Group jobs into buckets, as to only display those that are most relevant on
+# the CI machine. Jobs not declared here are not shown.
+# -----------------------------------------------------------------------------
+
+groups:
+- name: main
+  jobs:
+  - web
+  - esoft
+  - mocks
+  - product
+  - wassup
+  - client
+  - eligibility
+  - index-server
+  - e2e
+  - e2e-prod
+  - publish
+  - deploy-acceptance
+  - idzone
+- name: auxiliary
+  jobs:
+  - build-service-image
+  - build-e2e-image
+  - build-web-image
+  - build-deploy-image
+  - deploy-production
+  - deploy-recette
+  - major
+  - minor
+- name: 3rd-party-health
+  jobs:
+  - eligibility-health
+  - esoft-health
